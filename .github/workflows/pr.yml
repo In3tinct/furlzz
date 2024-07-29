@@ -1,14 +1,14 @@
-name: Release
+name: Build
+
 on:
-  push:
-    tags:
-      - v*.*.*
+  pull_request:
+    branches: [main]
 
 jobs:
   release:
     strategy:
       matrix:
-        frida_version: ["16.3.3"]
+        frida_version: ["16.1.9"]
     runs-on: macos-latest
     steps:
       -
@@ -34,19 +34,9 @@ jobs:
           version: ${{ matrix.frida_version }}
           outdir: /tmp/data/macos_amd64
       -
-        name: Download Frida macOS_arm64
-        uses: ./.github/actions/install-frida-devkit
-        with:
-          arch: arm64
-          os: macos
-          version: ${{ matrix.frida_version }}
-          outdir: /tmp/data/macos_arm64
-      -
-        name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v4
-        with:
-          distribution: goreleaser
-          version: latest
-          args: release --clean
+        name: Build
         env:
-          GITHUB_TOKEN: ${{ secrets.TOKEN }}
+          CGO_ENABLED: 1
+          CGO_LDFLAGS: -L/tmp/data/macos_arm64/lib
+          CGO_CFLAGS: -I/tmp/data/macos_arm64/include
+        run: go build
