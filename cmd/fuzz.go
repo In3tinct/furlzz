@@ -1,9 +1,9 @@
 package cmd
 
 import (
-	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -93,6 +93,11 @@ var fuzzCmd = &cobra.Command{
 			return err
 		}
 
+		wd, err := cmd.Flags().GetString("working-dir")
+		if err != nil {
+			return err
+		}
+
 		m := tui.NewModel()
 		m.Crash = crash
 		m.Runs = runs
@@ -110,9 +115,10 @@ var fuzzCmd = &cobra.Command{
 
 		p := tea.NewProgram(m)
 
+		mut := mutator.NewMutator(base, app, runs, fn, crash, validInputs...)
+
 		var sess *frida.Session = nil
 		var script *frida.Script = nil
-		hasCrashed := false
 
 		go func() {
 			if base == "" {
@@ -141,8 +147,6 @@ var fuzzCmd = &cobra.Command{
 				}
 				defer dev.Clean()
 
-				// Spawn app only if not in foreground
-				spawnApp(dev, app, p, false, sTimeout)
 				sess, err = dev.Attach(app, nil)
 				if err != nil {
 					sendErr(p, err.Error())
@@ -171,42 +175,40 @@ var fuzzCmd = &cobra.Command{
 			sendStats(p, fmt.Sprintf("Attached to %s", app))
 
 			var lastInput string
+			detached := make(chan struct{})
 
 			sess.On("detached", func(reason frida.SessionDetachReason, crash *frida.Crash) {
-				// Add sleep here so that we can wait for the context to get cancelled
-				time.Sleep(3 * time.Second)
+				detached <- struct{}{}
 				defer p.Send(tui.SessionDetached{})
-				if hasCrashed {
-					sendStats(p, fmt.Sprintf("Session detached; reason=%s", reason.String()))
-					out := fmt.Sprintf("fcrash_%s_%s", app, crashSHA256(lastInput))
-					err := func() error {
-						f, err := os.Create(out)
-						if err != nil {
-							return err
-						}
-						_, err = f.WriteString(lastInput)
-						return err
-					}()
+				sendStats(p, fmt.Sprintf("Session detached; reason=%s", reason.String()))
+				out := fmt.Sprintf("fcrash_%s_%s", app, crashSHA256(lastInput))
+				err := func() error {
+					f, err := os.Create(filepath.Join(wd, out))
 					if err != nil {
-						sendErr(p, fmt.Sprintf("Could not write crash file: %s", err.Error()))
-					} else {
-						sendStats(p, fmt.Sprintf("Written crash to: %s", out))
+						return err
 					}
-					s := Session{
-						App:           app,
-						Base:          base,
-						Delegate:      delegate,
-						Function:      fn,
-						Method:        method,
-						NetworkDevice: network,
-						Scene:         scene,
-						UIApp:         uiapp,
-					}
-					if err := s.WriteToFile(); err != nil {
-						sendErr(p, fmt.Sprintf("Could not write session file: %s", err.Error()))
-					} else {
-						sendStats(p, "Written session file")
-					}
+					_, err = f.WriteString(lastInput)
+					return err
+				}()
+				if err != nil {
+					sendErr(p, fmt.Sprintf("Could not write crash file: %s", err.Error()))
+				} else {
+					sendStats(p, fmt.Sprintf("Written crash to: %s", out))
+				}
+				s := Session{
+					App:           app,
+					Base:          base,
+					Delegate:      delegate,
+					Function:      fn,
+					Method:        method,
+					NetworkDevice: network,
+					Scene:         scene,
+					UIApp:         uiapp,
+				}
+				if err := s.WriteToFile(wd); err != nil {
+					sendErr(p, fmt.Sprintf("Could not write session file: %s", err.Error()))
+				} else {
+					sendStats(p, "Written session file")
 				}
 			})
 
@@ -230,19 +232,24 @@ var fuzzCmd = &cobra.Command{
 			_ = script.ExportsCall("setup_fuzz", method, uiapp, delegate, scene)
 			sendStats(p, "Finished fuzz setup")
 
-			mut := mutator.NewMutator(base, app, runs, fn, crash, validInputs...)
 			ch := mut.Mutate()
 
-			for mutated := range ch {
-				lastInput = mutated.Input
-				p.Send(tui.MutatedMsg(mutated))
-				ctx, _ := context.WithTimeout(context.Background(), 1*time.Second)
-				if err := script.ExportsCallWithContext(ctx, "fuzz", method, mutated.Input); err == frida.ErrContextCancelled {
-					hasCrashed = true
-					break
-				}
-				if timeout > 0 {
-					time.Sleep(time.Duration(timeout) * time.Second)
+		mLoop:
+			for {
+				select {
+				case <-detached:
+					mut.Close()
+					break mLoop
+				case <-m.ExitCh:
+					mut.Close()
+					break mLoop
+				case mutated := <-ch:
+					lastInput = mutated.Input
+					p.Send(tui.MutatedMsg(mutated))
+					script.ExportsCall("fuzz", method, mutated.Input)
+					if timeout > 0 {
+						time.Sleep(time.Duration(timeout) * time.Second)
+					}
 				}
 			}
 		}()
@@ -326,6 +333,7 @@ func init() {
 	fuzzCmd.Flags().StringP("delegate", "d", "", "UISceneDelegate class name")
 	fuzzCmd.Flags().StringP("uiapp", "u", "", "UIApplication class name")
 	fuzzCmd.Flags().StringP("scene", "s", "", "UIScene class name")
+	fuzzCmd.Flags().StringP("working-dir", "w", ".", "Working directory")
 	fuzzCmd.Flags().BoolP("crash", "c", false, "ignore previous crashes")
 	fuzzCmd.Flags().UintP("runs", "r", 0, "number of runs")
 	fuzzCmd.Flags().UintP("timeout", "t", 1, "sleep X seconds between each case")

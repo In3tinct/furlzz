@@ -12,6 +12,7 @@ import (
 
 type Model struct {
 	Crash       bool
+	Stopped     bool
 	Runs        uint
 	Timeout     uint
 	App         string
@@ -24,6 +25,7 @@ type Model struct {
 	Base        string
 	Input       string
 	ValidInputs []string
+	ExitCh      chan struct{}
 
 	exiting    bool
 	start      time.Time
@@ -54,6 +56,7 @@ func NewModel() Model {
 
 	m.seconds = 5
 	m.start = time.Now()
+	m.ExitCh = make(chan struct{})
 	return m
 }
 
@@ -67,6 +70,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "ctrl+c", "q":
 			m.exiting = true
+			m.ExitCh <- struct{}{}
 			return m, m.Tick()
 		}
 	case StatsMsg:
